@@ -1,0 +1,356 @@
+# YTMProbe build.yml
+# rev: 1
+#
+# YouTube Music の復号済み IPA に YTMProbe.dylib を注入して IPA を作る。
+#
+# ── ViviMusic のワークフローとの違い ────────────────────────
+#   ViviMusic : ソースだけから .app を作る (xcodegen + xcodebuild)
+#   YTMProbe  : dylib を作り、外部から取得した公式 IPA に注入する
+#
+# そのため **復号済み IPA の URL を入力で渡す** 必要がある。
+# リポジトリには IPA を置かない (サイズと配布の問題があるため)。
+#
+# 成果物は 3 つ。すべて JST のビルド時刻を頭に付ける。
+#   <stamp>_ytmprobe-ipa
+#   <stamp>_build-log
+#   <stamp>_Repository      … 中身は YTMProbe/ で包む
+#
+# 時刻は最初のステップで 1 度だけ決め、3 つで同じ値を使う。
+name: Build YTMProbe IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "復号済み YouTube Music IPA の URL"
+        required: true
+        type: string
+      host_app:
+        description: "注入先のアプリ"
+        required: true
+        default: "youtube"
+        type: choice
+        options:
+          - youtube
+          - youtubemusic
+      display_name:
+        description: "ホーム画面に出る名前"
+        required: false
+        default: "YT Probe"
+        type: string
+      bundle_id:
+        description: "bundle ID (公式と併存させるなら変える)"
+        required: false
+        default: "dev.vivimusic.ytprobe"
+        type: string
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Set build timestamp (JST)
+        run: |
+          STAMP=$(TZ=Asia/Tokyo date +'%Y-%m-%dT%H-%M-%S+09-00')
+          echo "STAMP=$STAMP" >> "$GITHUB_ENV"
+          echo "Build stamp: $STAMP"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ビルド生成物が混ざる前に退避する。
+      # YTMProbe/ で包むのは、展開先を間違えたときの事故を防ぐため。
+      - name: Snapshot repository
+        run: |
+          mkdir -p /tmp/repo-snapshot/YTMProbe
+          rsync -a --exclude='.git' ./ /tmp/repo-snapshot/YTMProbe/
+
+      # Theos は最後に ldid で dylib へ署名する。
+      # macOS runner には入っていないので先に用意する。
+      # (無いと "bash: ldid: command not found" でリンク後に失敗する)
+      - name: Install ldid
+        run: |
+          set -o pipefail
+          brew install ldid
+          ldid -v || true
+
+      - name: Install Theos
+        run: |
+          set -o pipefail
+          export THEOS=$HOME/theos
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          git clone --quiet --recursive https://github.com/theos/theos.git "$THEOS"
+
+      # iOS SDK は Theos 同梱のものが古いので別途取得する。
+      #
+      # ── cp -r を使わない理由 ──────────────────────────────
+      #
+      # theos/sdks はフレームワーク内で相対シンボリックリンクを多用して
+      # おり、リポジトリ単体では解決できないリンクが混じっている。
+      # cp -r はそこで止まる。
+      #
+      #   cp: .../IOKit.framework: No such file or directory
+      #   Error: Process completed with exit code 1
+      #
+      # rsync -a はリンクをリンクのまま運ぶので壊れたリンクでも通る。
+      #
+      # ── 全部取らない理由 ──────────────────────────────────
+      #
+      # theos/sdks には tvOS / watchOS も入っていて数 GB になる。
+      # 必要なのは iPhoneOS SDK だけなので sparse-checkout で絞る。
+      - name: Install iOS SDK
+        run: |
+          set -o pipefail
+          export THEOS=$HOME/theos
+          SDK_DIR="$THEOS/sdks"
+          mkdir -p "$SDK_DIR"
+
+          git clone --quiet --depth=1 --filter=blob:none --sparse \
+            https://github.com/theos/sdks.git /tmp/sdks
+          cd /tmp/sdks
+          git sparse-checkout set --no-cone 'iPhoneOS*.sdk'
+
+          echo "--- 取得できた iOS SDK ---"
+          ls -d /tmp/sdks/iPhoneOS*.sdk 2>/dev/null || {
+            echo "::error::iPhoneOS SDK が取得できませんでした"
+            exit 1
+          }
+
+          # シンボリックリンクをリンクのまま運ぶ。
+          rsync -a /tmp/sdks/iPhoneOS*.sdk "$SDK_DIR/"
+
+          echo "--- 配置した SDK ---"
+          ls "$SDK_DIR"
+
+          # Makefile の TARGET は latest なので、SDK が 1 つでもあれば通る。
+          # ここでは「本当に置けたか」だけを確かめる。
+          if ! ls -d "$SDK_DIR"/iPhoneOS*.sdk >/dev/null 2>&1; then
+            echo "::error::SDK の配置に失敗しました"
+            exit 1
+          fi
+
+      - name: Build dylib
+        run: |
+          set -o pipefail
+          export THEOS=$HOME/theos
+          make clean
+
+          # tee でログを残しつつ、make の終了コードをそのまま返す。
+          # (set -o pipefail が無いと tee の成功で握り潰される)
+          make 2>&1 | tee /tmp/build.log
+          echo "--- 出力物 ---"
+          find .theos -name '*.dylib' -print
+
+      - name: Verify dylib
+        run: |
+          set -o pipefail
+          # 署名前の中間物 (*.unsigned) を拾わないよう名前を厳密に指定する。
+          # 署名に失敗しても .unsigned だけは残ることがあり、
+          # それを注入すると実機で起動時に落ちる。
+          DYLIB=$(find .theos -type f -name 'YTMProbe.dylib' ! -name '*.unsigned' | head -1)
+          if [ -z "$DYLIB" ]; then
+            echo "::error::YTMProbe.dylib が見つかりません"
+            echo "--- .theos の中身 ---"
+            find .theos -type f -name '*.dylib*' -print
+            exit 1
+          fi
+          echo "DYLIB=$DYLIB" >> "$GITHUB_ENV"
+          file "$DYLIB"
+
+          # arm64 で作れているかを確かめる。
+          # 取り違えると SideStore で入れた瞬間に落ちる。
+          if ! file "$DYLIB" | grep -q arm64; then
+            echo "::error::arm64 ではありません"
+            exit 1
+          fi
+
+          # ldid の署名が乗っているかを確かめる。
+          # 未署名のまま注入しても実機で読み込まれない。
+          if ! codesign -dv "$DYLIB" 2>&1 | grep -qi 'signature\|Identifier'; then
+            echo "::warning::署名の確認が取れませんでした (ldid 署名は codesign では読めないことがあります)"
+          fi
+          ldid -e "$DYLIB" > /tmp/entitlements.xml 2>/dev/null || true
+          echo "--- entitlements ---"
+          cat /tmp/entitlements.xml 2>/dev/null || echo "(なし)"
+
+      - name: Download and validate IPA
+        run: |
+          set -o pipefail
+          # ホストに応じて期待する .app 名を決める
+          if [ "${{ inputs.host_app }}" = "youtubemusic" ]; then
+            echo "APP_NAME=YouTubeMusic" >> "$GITHUB_ENV"
+          else
+            echo "APP_NAME=YouTube" >> "$GITHUB_ENV"
+          fi
+          APP_NAME=$(grep '^APP_NAME=' "$GITHUB_ENV" | tail -1 | cut -d= -f2)
+
+          curl -sL --fail "${{ inputs.ipa_url }}" -o youtubemusic.ipa
+
+          SIZE=$(stat -f%z youtubemusic.ipa 2>/dev/null || stat -c%s youtubemusic.ipa)
+          echo "IPA サイズ: $SIZE バイト"
+          echo "MIME: $(file --mime-type -b youtubemusic.ipa)"
+
+          # ── MIME タイプで判定しない理由 ────────────────────────
+          #
+          # file は IPA を application/zip とは限らず
+          # application/x-ios-app と判定することがある
+          # (Payload/ を含む ZIP を iOS アプリとして認識するため)。
+          # 実測で x-ios-app が返り、ここで弾かれてビルドが止まった。
+          #
+          # MIME 名を並べて許可しても取りこぼす。ZIP として開けるか、
+          # 中身が目的のものかで判定するほうが確実。
+          if ! unzip -tqq youtubemusic.ipa >/dev/null 2>&1; then
+            echo "::error::ZIP として開けません。URL が HTML やエラーページを返している可能性があります"
+            head -c 200 youtubemusic.ipa | tr -c '[:print:]\n' '.'
+            exit 1
+          fi
+
+          # 中身が YouTube Music かを確かめる。
+          # 別のアプリに注入しても意味が無いので、ここで弾く。
+          if ! unzip -l youtubemusic.ipa | grep -q "Payload/$APP_NAME.app/"; then
+            echo "::error::Payload/$APP_NAME.app が見つかりません"
+            echo "--- 中身の先頭 ---"
+            unzip -l youtubemusic.ipa | head -20
+            exit 1
+          fi
+
+          # 復号済みか (cryptid=0) を確かめる。
+          # 暗号化されたままだと注入しても動かない。
+          unzip -qq -o youtubemusic.ipa "Payload/$APP_NAME.app/$APP_NAME" -d /tmp/ipacheck
+          python3 - <<'PY'
+          import struct, sys
+          import os, glob
+          f = open(glob.glob('/tmp/ipacheck/Payload/*.app/*')[0],'rb')
+          d = f.read(1 << 16)
+          magic, cputype, cpusub, ftype, ncmds, szcmds, flags, res = \
+              struct.unpack('<IiiIIIII', d[:32])
+          off, found = 32, False
+          for _ in range(ncmds):
+              cmd, cmdsize = struct.unpack('<II', d[off:off+8])
+              if cmd in (0x21, 0x2C):
+                  cryptoff, cryptsize, cryptid = struct.unpack('<III', d[off+8:off+20])
+                  print(f'LC_ENCRYPTION_INFO cryptid={cryptid}')
+                  found = True
+                  if cryptid != 0:
+                      print('::error::暗号化されたままの IPA です (cryptid != 0)')
+                      sys.exit(1)
+              off += cmdsize
+          if not found:
+              print('暗号化ロードコマンドなし (復号済みとみなす)')
+          PY
+
+      # cyan (pyzule-rw) は IPA に dylib を注入するツール。
+      #
+      # ── venv を使う理由 ──────────────────────────────────────
+      #
+      # macOS runner の Python は Homebrew 管理下にあり、PEP 668 の
+      # 「外部管理環境」になっている。素の pip install は弾かれる。
+      #
+      #   error: externally-managed-environment
+      #
+      # --break-system-packages で押し通せるが、Homebrew 自身が
+      # 「Homebrew の導入を壊しうる」と警告している方法なので使わない。
+      # venv なら隔離されるので副作用が無い。
+      - name: Install cyan
+        run: |
+          set -o pipefail
+          python3 -m venv /tmp/cyanenv
+          /tmp/cyanenv/bin/python -m pip install --quiet --upgrade pip
+          /tmp/cyanenv/bin/python -m pip install --quiet \
+            https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+
+          # 以降のステップから cyan を直接呼べるようにする。
+          echo "/tmp/cyanenv/bin" >> "$GITHUB_PATH"
+
+          /tmp/cyanenv/bin/cyan --version
+
+      - name: Inject dylib
+        run: |
+          set -o pipefail
+          OUT="YTMProbe_${{ env.STAMP }}.ipa"
+
+          # ── オプションの意図 ──────────────────────────────────
+          #
+          #   -f  注入する dylib
+          #   -u  UISupportedDevices を消す (iPad で入らない事故を防ぐ)
+          #   -w  watch アプリを消す
+          #   -e  **app 拡張をすべて消す**
+          #       無料 Personal Team は App ID が週 10 個までで、
+          #       拡張ひとつごとに枠を消費する。検証には不要なので落とす。
+          #       実測: 252 エントリ分の .appex が消える。
+          #   -s  fakesign。SideStore が後で再署名するので必須ではないが、
+          #       付けておくと署名まわりの事故が減る。
+          #   --overwrite  再実行時に確認待ちで固まらないようにする
+          #
+          cyan -i youtubemusic.ipa -o "$OUT" -uwesf "$DYLIB" \
+            -n "${{ inputs.display_name }}" \
+            -b "${{ inputs.bundle_id }}" \
+            --overwrite
+
+          echo "OUT_IPA=$OUT" >> "$GITHUB_ENV"
+          ls -la "$OUT"
+
+      # 注入が実際に効いているかを確かめる。
+      # cyan は dylib を入れ損ねても成功で終わることがあるので、
+      # 成果物を渡す前に中身を見る。
+      - name: Verify injected IPA
+        run: |
+          set -o pipefail
+          rm -rf /tmp/outcheck
+          unzip -qq -o "$OUT_IPA" -d /tmp/outcheck
+
+          APP=$(ls -d /tmp/outcheck/Payload/*.app | head -1)
+          echo "--- アプリ: $APP"
+
+          # dylib が同梱されたか
+          if [ ! -f "$APP/Frameworks/YTMProbe.dylib" ]; then
+            echo "::error::YTMProbe.dylib が同梱されていません"
+            ls "$APP/Frameworks" 2>/dev/null | head -20
+            exit 1
+          fi
+          echo "dylib 同梱: OK"
+
+          # 本体バイナリが dylib を読み込むようになったか。
+          # LC_LOAD_DYLIB が追加されていないと、入っていても動かない。
+          BIN="$APP/$(python3 -c "
+          import plistlib
+          print(plistlib.load(open('$APP/Info.plist','rb'))['CFBundleExecutable'])
+          ")"
+          if ! otool -L "$BIN" | grep -q 'YTMProbe.dylib'; then
+            echo "::error::本体バイナリに YTMProbe.dylib の読み込みが追加されていません"
+            otool -L "$BIN" | head -20
+            exit 1
+          fi
+          echo "LC_LOAD_DYLIB: OK"
+
+          # bundle id と表示名が反映されたか
+          python3 -c "
+          import plistlib
+          d = plistlib.load(open('$APP/Info.plist','rb'))
+          print('bundle id  =', d.get('CFBundleIdentifier'))
+          print('表示名     =', d.get('CFBundleDisplayName'))
+          print('最低 iOS   =', d.get('MinimumOSVersion'))
+          "
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_ytmprobe-ipa
+          path: ${{ env.OUT_IPA }}
+          include-hidden-files: true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_build-log
+          path: /tmp/build.log
+          include-hidden-files: true
+
+      - name: Upload repository snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_Repository
+          path: /tmp/repo-snapshot
+          include-hidden-files: true

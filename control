@@ -1,0 +1,9 @@
+Package: dev.vivimusic.ytmprobe
+Name: YTMProbe
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: YouTube Music に注入して再生を駆動できるかを確かめる検証用 tweak
+Maintainer: ViviMusic
+Author: ViviMusic
+Section: Utilities
+Depends: mobilesubstrate
